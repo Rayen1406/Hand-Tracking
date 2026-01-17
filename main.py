@@ -20,69 +20,63 @@ cap = cv2.VideoCapture(0)
 
 # --- Gallery Loading ---
 GALLERY_PATH = "gallery"
-loaded_images = [] # Tuples: (original, thumbnail)
+loaded_images = [] 
 image_files = sorted(glob.glob(os.path.join(GALLERY_PATH, "*")))
 
 for f in image_files:
     img = cv2.imread(f)
     if img is not None:
-        # Resize for thumbnail (fixed width 120, maintain aspect ratio)
-        h, w, _ = img.shape
-        thumb_w = 120
-        thumb_h = int(h * (thumb_w / w))
-        thumb = cv2.resize(img, (thumb_w, thumb_h))
-        loaded_images.append((img, thumb))
-
-# --- UI Helpers ---
-def draw_rounded_rect(img, rect, color, radius=15, alpha=1.0, filled=True, progress_fill=0.0):
-    """
-    Draws a rounded rectangle with alpha blending and optional progress fill.
-    progress_fill: 0.0 to 1.0 (fills background from left to right)
-    """
-    x, y, w, h = rect
-    
-    # Create overlay
-    overlay = img.copy()
-    
-    # 1. Background Fill
-    if filled:
-        # Check boundary to avoid drawing errors
-        if radius * 2 > w or radius * 2 > h: radius = min(w, h) // 2
-
-        # Draw Base Rounded Rect
-        cv2.rectangle(overlay, (x+radius, y), (x+w-radius, y+h), color, -1)
-        cv2.rectangle(overlay, (x, y+radius), (x+w, y+h-radius), color, -1)
-        cv2.circle(overlay, (x+radius, y+radius), radius, color, -1)
-        cv2.circle(overlay, (x+w-radius, y+radius), radius, color, -1)
-        cv2.circle(overlay, (x+w-radius, y+h-radius), radius, color, -1)
-        cv2.circle(overlay, (x+radius, y+h-radius), radius, color, -1)
+        loaded_images.append(img)
         
-        # Progress Fill (Green overlay on top of button color)
-        if progress_fill > 0:
-            fill_w = int(w * progress_fill)
-            if fill_w > 0:
-                # To account for rounded corners properly is hard, simplified: 
-                # Fill from left. 
-                cv2.rectangle(overlay, (x, y), (x + fill_w, y + h), (0, 255, 0), -1)
+current_img_idx = 0
 
-    # Blend
-    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+# --- Gesture Helpers ---
+def calc_dist(p1, p2):
+    return math.hypot(p1.x - p2.x, p1.y - p2.y)
 
-def draw_centered_text(img, text, rect, font_scale=0.8, color=(255, 255, 255), thickness=2):
-    x, y, w, h = rect
-    (fw, fh), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
-    text_x = x + (w - fw) // 2
-    text_y = y + (h + fh) // 2
-    cv2.putText(img, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
+def get_hand_state(landmarks):
+    """
+    Returns 'PINCHED' or 'OPEN' based on finger dispersion.
+    """
+    tips_ids = [4, 8, 12, 16, 20]
+    tips = [landmarks.landmark[i] for i in tips_ids]
+    
+    cx = sum([p.x for p in tips]) / 5
+    cy = sum([p.y for p in tips]) / 5
+    centroid = type('obj', (object,), {'x': cx, 'y': cy})
+    
+    max_d = 0
+    for p in tips:
+        d = calc_dist(p, centroid)
+        if d > max_d: max_d = d
+        
+    if max_d < 0.05: return 'PINCHED' # Tight pinch
+    if max_d > 0.15: return 'OPEN'    # Fingers spread
+    return 'NEUTRAL'
+
+def is_two_fingers_up(landmarks):
+    wrist = landmarks.landmark[0]
+    def is_extended(tip_id, pip_id):
+        # Tip further from wrist than PIP
+        return calc_dist(landmarks.landmark[tip_id], wrist) > calc_dist(landmarks.landmark[pip_id], wrist) + 0.02
+        
+    index_up = is_extended(8, 6)
+    middle_up = is_extended(12, 10)
+    ring_up = is_extended(16, 14)
+    pinky_up = is_extended(20, 18)
+    
+    # Strict 2 fingers: Index & Middle UP, Ring & Pinky DOWN
+    return index_up and middle_up and (not ring_up) and (not pinky_up)
 
 # --- State ---
-hover_start_time = None
-thumb_hover_start = None
-thumb_hover_idx = -1
+menu_open = False
+state_lock_time = 0
 
-is_expanded = False
-scroll_offset = 0
-preview_idx = None
+# Swipe State Machine
+# States: 'IDLE', 'TRACKING', 'COOLDOWN'
+swipe_state = 'IDLE'
+swipe_start_x = 0
+swipe_start_time = 0
 
 while True:
     ret, frame = cap.read()
@@ -94,168 +88,125 @@ while True:
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb)
 
-    # --- UI Layout ---
-    btn_w, btn_h = 200, 80
-    btn_x = w - btn_w - 40
-    btn_y = 50
-    btn_rect = (btn_x, btn_y, btn_w, btn_h)
-    
-    panel_h = 400
-    panel_y = btn_y + btn_h + 10
-    panel_rect = (btn_x, panel_y, btn_w, panel_h)
-    
     # --- Interaction Logic ---
-    cursor_pos = None
-    is_hovering_btn = False
-    btn_progress = 0
-    
     if results.multi_hand_landmarks:
         hand_landmarks = results.multi_hand_landmarks[0]
         mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
         
-        index_tip = hand_landmarks.landmark[8]
-        ix, iy = int(index_tip.x * w), int(index_tip.y * h)
-        cursor_pos = (ix, iy)
-        
-        # 1. Preview Mode Interaction (Close)
-        if preview_idx is not None:
-            close_btn_rect = (w//2 - 100, h - 100, 200, 60)
-            if (close_btn_rect[0] <= ix <= close_btn_rect[0]+200) and (close_btn_rect[1] <= iy <= close_btn_rect[1]+60):
-                if hover_start_time is None: hover_start_time = time.time()
-                elapsed = time.time() - hover_start_time
-                if elapsed > 1.5:
-                     preview_idx = None
-                     hover_start_time = None
-            else:
-                 # Only reset if we are NOT on button. But inside preview mode loop below, 
-                 # we don't have else logic easily.
-                 # Simplified: 
-                 pass 
-        
-        # 2. Main Menu Interaction (Only if not in preview)
-        elif (btn_rect[0] <= ix <= btn_rect[0]+btn_w) and (btn_rect[1] <= iy <= btn_rect[1]+btn_h):
-            is_hovering_btn = True
-            if hover_start_time is None: hover_start_time = time.time()
-            elapsed = time.time() - hover_start_time
-            btn_progress = min(elapsed / 2.0, 1.0)
-            if elapsed > 2.0:
-                is_expanded = not is_expanded
-                hover_start_time = None
-        
-        # 3. Panel Interaction (Scroll & Thumbs)
-        elif is_expanded and (panel_rect[0] <= ix <= panel_rect[0]+btn_w) and (panel_rect[1] <= iy <= panel_rect[1]+panel_h):
-            # Scroll Zones
-            rel_y = iy - panel_y
-            if rel_y < 60: # Top 60px -> Scroll Up
-                scroll_offset = max(0, scroll_offset - 10)
-            elif rel_y > panel_h - 60: # Bottom 60px -> Scroll Down
-                # Allow infinite scroll down for simplicity or check len(loaded_images)
-                scroll_offset += 10
+        # 1. Menu Toggle (Pinch = Open, Unpinch/Open = Close)
+        if time.time() > state_lock_time:
+            hand_state = get_hand_state(hand_landmarks)
             
-            # Thumbnail Hover
-            content_y = panel_y + 40 - scroll_offset
-            hovered_idx = -1
+            # To ensure we don't accidentally close while swiping, check swipe state?
+            # Or just rely on "Two fingers up" != "Open Hand". 
+            # Open hand requires ALL fingers spread. Two fingers requires Ring/Pinky down.
+            # So interactions should be distinct.
             
-            for i, (orig, thumb) in enumerate(loaded_images):
-                th, tw, _ = thumb.shape
-                roi_x = btn_x + (btn_w - tw)//2
-                
-                if (roi_x <= ix <= roi_x+tw) and (content_y <= iy <= content_y+th):
-                    if (content_y >= panel_y) and (content_y + th <= panel_y + panel_h):
-                        hovered_idx = i
-                
-                content_y += th + 20
-            
-            if hovered_idx != -1:
-                if thumb_hover_idx != hovered_idx:
-                    thumb_hover_idx = hovered_idx
-                    thumb_hover_start = time.time()
-                elif time.time() - thumb_hover_start > 1.0: # 1s to open preview
-                    preview_idx = hovered_idx
-                    thumb_hover_idx = -1
-                    thumb_hover_start = None
-            else:
-                thumb_hover_idx = -1
-                thumb_hover_start = None
+            if hand_state == 'PINCHED' and not menu_open:
+                menu_open = True
+                state_lock_time = time.time() + 1.0 # 1s cooldown
+            elif hand_state == 'OPEN' and menu_open:
+                 # Only quit if not in the middle of a valid swipe tracking
+                 if swipe_state == 'IDLE':
+                    menu_open = False
+                    state_lock_time = time.time() + 1.0
 
+        # 2. Swipe Navigation (Robust State Machine)
+        if menu_open and is_two_fingers_up(hand_landmarks):
+            # Track Center X
+            ix = hand_landmarks.landmark[8].x * w
+            mx = hand_landmarks.landmark[12].x * w
+            curr_x = (ix + mx) / 2
+            
+            if swipe_state == 'IDLE':
+                swipe_state = 'TRACKING'
+                swipe_start_x = curr_x
+                swipe_start_time = time.time()
+                
+            elif swipe_state == 'TRACKING':
+                dx = curr_x - swipe_start_x
+                dt = time.time() - swipe_start_time
+                
+                # Check Distance Threshold (Commitment)
+                if abs(dx) > 40:  # Lowered threshold for higher sensitivity
+                    # Check Speed (Intent)
+                    if dt < 0.4: # Increased time window to allow slightly slower swipes
+                        if dx > 0: # Right (L->R) -> Next
+                             if current_img_idx < len(loaded_images) - 1:
+                                 current_img_idx += 1
+                                 cv2.circle(frame, (w-50, h//2), 30, (0, 200, 0), -1) # Highlight Right
+                        else: # Left (R->L) -> Prev
+                             if current_img_idx > 0:
+                                 current_img_idx -= 1
+                                 cv2.circle(frame, (50, h//2), 30, (0, 200, 0), -1) # Highlight Left
+                        
+                        swipe_state = 'COOLDOWN' # Triggered success
+                    else:
+                        # Too slow (Drifting) -> Invalid
+                        swipe_state = 'COOLDOWN' 
+            
+            # If COOLDOWN, we wait here doing nothing until fingers dropped
+                        
         else:
-            hover_start_time = None
-            thumb_hover_idx = -1
+            # Fingers dropped or changed pose -> Reset
+            swipe_state = 'IDLE'
 
     # --- Rendering ---
-    
-    # 1. Preview Mode Overlay
-    if preview_idx is not None:
-        # Dark Overlay
+    if menu_open:
+        # Overlay
         overlay = np.zeros_like(frame)
         cv2.addWeighted(frame, 0.3, overlay, 0.7, 0, frame)
         
-        # Large Image
-        img_full = loaded_images[preview_idx][0]
-        ih, iw, _ = img_full.shape
-        scale = min((w - 100)/iw, (h - 200)/ih) # Fit to screen with padding
-        nh, nw = int(ih*scale), int(iw*scale)
-        if nw > 0 and nh > 0:
-            img_resized = cv2.resize(img_full, (nw, nh))
-            dx = (w - nw)//2
-            dy = (h - nh)//2
-            frame[dy:dy+nh, dx:dx+nw] = img_resized
-        
-        # Close Button
-        close_x = w//2 - 100
-        close_y = h - 100
-        close_rect = (close_x, close_y, 200, 60)
-        
-        # Check hover for progress drawing
-        close_prog = 0
-        if cursor_pos: 
-            cx, cy = cursor_pos
-            if (close_x <= cx <= close_x+200) and (close_y <= cy <= close_y+60):
-                if hover_start_time:
-                    close_prog = min((time.time() - hover_start_time)/1.5, 1.0)
-        
-        draw_rounded_rect(frame, close_rect, (0, 0, 255), 30, 0.8, filled=True, progress_fill=close_prog)
-        draw_centered_text(frame, "CLOSE", close_rect)
-        
-        # Draw Cursor
-        if cursor_pos: cv2.circle(frame, cursor_pos, 8, (255, 0, 255), -1)
-
-    else:
-        # 2. Collapsing Panel
-        if is_expanded:
-            draw_rounded_rect(frame, panel_rect, (255, 255, 255), 15, 0.2)
+        if loaded_images:
+            img = loaded_images[current_img_idx]
+            ih, iw, _ = img.shape
             
-            # Content
-            current_y = panel_y + 40 - scroll_offset
+            # Target Size
+            target_w = 500
+            scale = target_w / iw
+            nh, nw = int(ih * scale), int(iw * scale)
             
-            for i, (orig, thumb) in enumerate(loaded_images):
-                th, tw, _ = thumb.shape
-                roi_x = btn_x + (btn_w - tw)//2
-                roi_y = int(current_y)
+            # Clamp
+            if nh > h - 100:
+                scale = (h - 100) / ih
+                nh, nw = int(ih * scale), int(iw * scale)
                 
-                # Manual Clipping
-                if roi_y >= panel_y and roi_y + th <= panel_y + panel_h:
-                     frame[roi_y:roi_y+th, roi_x:roi_x+tw] = thumb
-                     
-                     # Highlight if hovering
-                     if i == thumb_hover_idx:
-                         cv2.rectangle(frame, (roi_x, roi_y), (roi_x+tw, roi_y+th), (0, 255, 255), 2)
-                         # Progress bar on top of thumb?
-                         if thumb_hover_start:
-                             prog = (time.time() - thumb_hover_start) / 1.0
-                             cv2.rectangle(frame, (roi_x, roi_y+th-5), (roi_x+int(tw*prog), roi_y+th), (0, 255, 0), -1)
-
-                current_y += th + 20
-
-        # 3. Main Menu Button
-        btn_alpha = 0.4 if is_hovering_btn else 0.2
-        draw_rounded_rect(frame, btn_rect, (255, 255, 255), 20, btn_alpha, filled=True, progress_fill=btn_progress)
-        text = "MENU" if not is_expanded else "CLOSE"
-        draw_centered_text(frame, text, btn_rect, 1.0)
-        
-        # Cursor
-        if cursor_pos:
-             cv2.circle(frame, cursor_pos, 8, (255, 0, 255), -1)
+            img_resized = cv2.resize(img, (nw, nh))
+            dy = (h - nh) // 2
+            dx = (w - nw) // 2
+            
+            frame[dy:dy+nh, dx:dx+nw] = img_resized
+            
+            # Hints (Arrows)
+            l_center_y = h // 2
+            
+            # Left Arrow (Prev) - Show only if we have prev images
+            if current_img_idx > 0:
+                cv2.arrowedLine(frame, (100, l_center_y), (40, l_center_y), (255, 255, 255), 5, tipLength=0.5)
+            
+            # Right Arrow (Next) - Show only if we have next images
+            if current_img_idx < len(loaded_images) - 1:
+                cv2.arrowedLine(frame, (w-100, l_center_y), (w-40, l_center_y), (255, 255, 255), 5, tipLength=0.5)
+            
+            # Counter
+            cv2.putText(frame, f"{current_img_idx+1}/{len(loaded_images)}", 
+                        (w//2 - 40, dy + nh + 40), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+            # Text Hint
+            cv2.putText(frame, "Open hand to close", (w//2 - 100, 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+        else:
+             cv2.putText(frame, "No Images", (w//2 - 80, h//2), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                        
+    else:
+        # Hint text when closed
+        cv2.putText(frame, "Pinch 5 fingers to open menu", (20, h - 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                    
+    # Debug State
+    # cv2.putText(frame, f"State: {swipe_state}", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
     cv2.imshow("Hand Tracking Camera", frame)
     if cv2.waitKey(1) & 0xFF == 27:
